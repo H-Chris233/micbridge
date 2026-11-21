@@ -1,47 +1,57 @@
 // MicBridge Receiver — runs on the Mac mini.
 // Watches whether any app is recording from the BlackHole virtual device.
-// It keeps a connection to the sender on the MacBook Air open at all times; when an
-// app records, it asks the Air to switch its microphone on and plays the incoming
-// audio into BlackHole, so the app hears the Air's mic. When recording stops, it
-// asks the Air to switch the microphone off again.
+// It keeps an authenticated TLS connection to the sender open. When an app
+// records, it requests the microphone and plays incoming audio into BlackHole.
+// After recording stops, it asks the sender to switch the microphone off again.
 
+import AppKit
 import AudioToolbox
 import CoreAudio
 import Foundation
 import Network
 
-setvbuf(stdout, nil, _IOLBF, 0)
-
-func log(_ msg: String) {
-    let f = DateFormatter()
-    f.dateFormat = "HH:mm:ss"
-    print("[\(f.string(from: Date()))] \(msg)")
+@main
+struct ReceiverMain {
+    static func main() {
+        setvbuf(stdout, nil, _IOLBF, 0)
+        var options = ReceiverOptions()
+        var args = CommandLine.arguments.dropFirst().makeIterator()
+        func usage() -> Never {
+            print("usage: micbridge-receiver [--host IP] [--port N] [--device NAME] [--always-on] [--no-set-default]")
+            exit(2)
+        }
+        while let arg = args.next() {
+            switch arg {
+            case "--host": guard let value = args.next(), !value.isEmpty else { usage() }; options.host = value
+            case "--port": guard let text = args.next(), let value = UInt16(text), value != 0 else { usage() }; options.port = value
+            case "--device": guard let value = args.next(), !value.isEmpty else { usage() }; options.device = value
+            case "--always-on": options.alwaysOn = true
+            case "--no-set-default": options.setDefault = false
+            default: usage()
+            }
+        }
+        guard let device = findDevice(matching: options.device) else {
+            log("no audio device matching \(options.device) — install BlackHole first: brew install --cask blackhole-2ch")
+            exit(1)
+        }
+        log("using virtual device: \(deviceName(device))")
+        if options.setDefault { setDefaultInput(device) }
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+        let receiver = Receiver(device: device, options: options)
+        let menu = MenuBar(sender: false, begin: { receiver.requestPairing() }, forget: { receiver.forget() })
+        receiver.menu = menu
+        receiver.start()
+        withExtendedLifetime(menu) { app.run() }
+    }
 }
 
-let serviceType = "_micbridge._tcp"
-var host: String?
-var port: UInt16 = 50555
-var deviceMatch = "BlackHole"
-var alwaysOn = false
-var setDefault = true
-var args = CommandLine.arguments.dropFirst().makeIterator()
-while let a = args.next() {
-    switch a {
-    case "--host": host = args.next()
-    case "--port": port = UInt16(args.next() ?? "") ?? port
-    case "--device": deviceMatch = args.next() ?? deviceMatch
-    case "--always-on": alwaysOn = true
-    case "--no-set-default": setDefault = false
-    default:
-        print("""
-        usage: micbridge-receiver [--host IP] [--port N] [--device NAME] [--always-on] [--no-set-default]
-          --host        connect to this address instead of finding the Air via Bonjour
-          --device      virtual device name to feed (default: BlackHole)
-          --always-on   keep streaming even when nothing is recording
-          --no-set-default  don't make the virtual device the default input
-        """)
-        exit(2)
-    }
+struct ReceiverOptions {
+    var host: String?
+    var port: UInt16 = 50555
+    var device = "BlackHole"
+    var alwaysOn = false
+    var setDefault = true
 }
 
 // MARK: - Core Audio helpers
@@ -221,183 +231,261 @@ final class DeviceOutput {
 final class Receiver {
     private let queue = DispatchQueue(label: "micbridge.receiver")
     private let device: AudioDeviceID
+    private let options: ReceiverOptions
+    private let store = PairingStore(role: "receiver")
+    weak var menu: MenuBar?
     private var browser: NWBrowser?
-    private var senderEndpoint: NWEndpoint?
-    private var conn: NWConnection?
-    private var ready = false
+    private var timer: DispatchSourceTimer?
+    private var candidates: [NWEndpoint] = []
+    private var nextCandidate = 0
+    private var nextAttempt: TimeInterval = 0
+    private var tried = 0
+    private var failures = 0
+    private var pairingKey: Data?
+    private var storageError = false
+    private var choosing = false
+    private var pairing = false
+    private var conn: BridgeConnection?
+    private var authenticated = false
     private var micRequested = false
+    private var hasHeader = false
+    private var pauseSentAt: TimeInterval?
     private var output: DeviceOutput?
     private var outputRate: Double = 0
     private var ring: RingBuffer?
-    private var pending = Data()
-    private var idleSince: Date?
-    private var lastAttempt: Date?
-    private var failures = 0  // consecutive failed attempts, for backoff and quieter logs
-    private var requestedAt: Date?
+    private var idleSince: TimeInterval?
+    private var requestedAt: TimeInterval?
+    private var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
 
-    init(device: AudioDeviceID) { self.device = device }
+    init(device: AudioDeviceID, options: ReceiverOptions) { self.device = device; self.options = options }
 
     func start() {
-        if let host {
-            senderEndpoint = .hostPort(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!)
-        } else {
-            let b = NWBrowser(for: .bonjour(type: serviceType, domain: nil), using: .tcp)
-            b.browseResultsChangedHandler = { [weak self] results, _ in
-                guard let self else { return }
-                let ep = results.first?.endpoint
-                if ep != self.senderEndpoint {
-                    self.senderEndpoint = ep
-                    log(ep.map { "found sender: \($0)" } ?? "sender went away")
-                    // An attempt still pending from before the sender went away (e.g. it
-                    // fell asleep mid-connect) will never finish; start over.
-                    if ep != nil && self.conn != nil && !self.ready { self.disconnect() }
-                    // It just (re)appeared, so try right away instead of waiting out the backoff.
-                    if ep != nil { self.lastAttempt = nil; self.failures = 0 }
+        queue.async { [self] in
+            do { self.pairingKey = try self.store.load() }
+            catch { self.storageError = true; log("cannot read receiver pairing record") }
+            if let host = self.options.host, let port = NWEndpoint.Port(rawValue: self.options.port) {
+                self.candidates = [.hostPort(host: NWEndpoint.Host(host), port: port)]
+            } else {
+                let browser = NWBrowser(for: .bonjour(type: serviceType, domain: nil), using: .tcp)
+                browser.browseResultsChangedHandler = { [weak self] results, _ in
+                    guard let self else { return }
+                    let endpoints = Set(results.map(\.endpoint)).sorted { $0.debugDescription < $1.debugDescription }
+                    guard endpoints != self.candidates else { return }
+                    self.candidates = endpoints
+                    self.resetRetry()
+                    if !self.pairing, !self.authenticated, let conn = self.conn,
+                       !endpoints.contains(conn.connection.endpoint) { conn.close() }
+                }
+                browser.start(queue: self.queue)
+                self.browser = browser
+            }
+            let timer = DispatchSource.makeTimerSource(queue: self.queue)
+            timer.schedule(deadline: .now(), repeating: .milliseconds(250))
+            timer.setEventHandler { [weak self] in self?.tick() }
+            self.timer = timer
+            self.updateMenu()
+            timer.resume()
+        }
+    }
+
+    func requestPairing() {
+        queue.async { [self] in
+            guard !self.choosing, !self.pairing, self.pairingKey == nil, !self.storageError else { return }
+            self.choosing = true
+            self.updateMenu()
+            let endpoints = self.candidates
+            let names = endpoints.map { endpoint in
+                if case let .service(name, _, domain, interface) = endpoint {
+                    return interface.map { "\(name) (\($0.name))" } ?? "\(name) (\(domain))"
+                }
+                return endpoint.debugDescription
+            }
+            DispatchQueue.main.async {
+                let selection = self.menu?.requestPIN(names: names)
+                self.queue.async { [self] in
+                    self.choosing = false
+                    self.updateMenu()
+                    guard let (index, pin) = selection, endpoints.indices.contains(index), self.pairingKey == nil,
+                          !self.storageError else { return }
+                    guard validPIN(pin) else { self.showMessage("请输入恰好 4 位数字", "例如 0042。"); return }
+                    self.pairing = true
+                    self.updateMenu()
+                    self.connect(endpoints[index], pin: pin)
                 }
             }
-            b.start(queue: queue)
-            browser = b
         }
-        let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now(), repeating: .milliseconds(250))
-        timer.setEventHandler { [weak self] in self?.tick() }
-        timer.resume()
-        _timer = timer
     }
-    private var _timer: DispatchSourceTimer?
+
+    func forget() {
+        queue.async { [self] in
+            self.pairingKey = nil
+            self.pairing = false
+            self.conn?.close()
+            do { try self.store.remove(); self.storageError = false }
+            catch {
+                self.storageError = true
+                self.showMessage("未能删除配对记录", "本次运行已禁止连接。修复文件权限后重试；重启前请确认已删除记录。")
+            }
+            self.updateMenu()
+        }
+    }
+
+    private func updateMenu() {
+        let paired = pairingKey != nil, busy = choosing || pairing, error = storageError, connected = authenticated
+        DispatchQueue.main.async { [weak self] in
+            self?.menu?.update(paired: paired, busy: busy, storageError: error, connected: connected)
+        }
+    }
+
+    private func showMessage(_ title: String, _ detail: String) {
+        DispatchQueue.main.async { [weak self] in self?.menu?.alert(title, detail) }
+    }
+
+    private func resetRetry() { nextCandidate = 0; nextAttempt = 0; tried = 0; failures = 0 }
 
     private func tick() {
-        if conn != nil && !ready, let t = lastAttempt, Date().timeIntervalSince(t) > 8 {
-            failures += 1
-            if failures == 1 { log("connection attempt timed out — retrying in the background") }
-            disconnect()
+        if conn == nil, pairingKey != nil, !storageError, !candidates.isEmpty, now >= nextAttempt {
+            let endpoint = candidates[nextCandidate % candidates.count]
+            nextCandidate = (nextCandidate + 1) % candidates.count
+            tried += 1
+            connect(endpoint)
         }
-        if conn == nil { connect() }
-        let wanted = alwaysOn || someoneIsRecording(from: device)
-        if wanted {
+        guard authenticated, let conn else { return }
+        if let pauseSentAt {
+            if now - pauseSentAt >= handshakeTimeout { conn.close() }
+            return
+        }
+        if options.alwaysOn || someoneIsRecording(from: device) {
             idleSince = nil
-            if ready && !micRequested {
-                log("an app started recording — turning the MacBook mic on")
-                command("S")
+            if !micRequested {
+                log("requesting the paired microphone")
                 micRequested = true
-                requestedAt = Date()
+                hasHeader = false
+                requestedAt = now
+                conn.send(BridgeFrame(.start))
             }
         } else if micRequested {
             // Short grace period so brief pauses between recordings don't bounce the mic.
-            if idleSince == nil { idleSince = Date() }
-            if Date().timeIntervalSince(idleSince!) > 3 {
+            if idleSince == nil { idleSince = now }
+            if let idleSince, now - idleSince >= 3 {
                 log("no app is recording any more — turning the MacBook mic off")
-                command("P")
                 micRequested = false
-                idleSince = nil
+                hasHeader = false
+                requestedAt = nil
+                ring?.reset()
+                pauseSentAt = now
+                conn.send(BridgeFrame(.pause))
             }
         }
     }
 
-    private func command(_ c: String) {
-        conn?.send(content: Data(c.utf8), completion: .idempotent)
-    }
-
-    // The connection stays up all the time so a recording only has to wait for the
-    // Air's microphone to switch on, not for discovery, TCP setup and audio engine start.
-    private func connect() {
-        guard let ep = senderEndpoint else { return }
-        // Retry every 2 s at first, backing off to every 30 s while the sender stays unreachable.
-        let delay = min(30, 2 * pow(2, Double(min(failures, 4))))
-        if let t = lastAttempt, Date().timeIntervalSince(t) < delay { return }
-        lastAttempt = Date()
-        let tcp = NWProtocolTCP.Options()
-        tcp.noDelay = true
-        tcp.enableKeepalive = true
-        tcp.keepaliveIdle = 10
-        tcp.keepaliveInterval = 5
-        tcp.keepaliveCount = 2
-        tcp.connectionTimeout = 5
-        let c = NWConnection(to: ep, using: NWParameters(tls: nil, tcp: tcp))
-        conn = c
-        c.stateUpdateHandler = { [weak self] state in
-            guard let self, self.conn === c else { return }
-            switch state {
-            case .ready:
-                log("connected to \(ep)")
-                self.ready = true
-                self.failures = 0
-                self.pending = Data()
-                self.ensurePlayback(sampleRate: 48000)  // warm up; rebuilt if the Air uses another rate
-                self.receive(c)
-            case .failed(let e), .waiting(let e):
-                self.failures += 1
-                if self.failures == 1 || self.failures % 20 == 0 {
-                    log("cannot reach sender (\(e)) — retrying in the background")
-                }
-                self.disconnect()
-            default: break
+    // The authenticated connection stays open across recordings.
+    private func connect(_ endpoint: NWEndpoint, pin: String? = nil) {
+        let client = BridgeConnection(NWConnection(to: endpoint, using: secureParameters(queue: queue)))
+        conn = client
+        var submittedPIN = pin
+        client.start(on: queue, ready: { [weak self, weak client] exporter in
+            guard let self, let client, self.conn === client else { return }
+            let (handshake, hello): (Handshake, BridgeFrame)
+            if let pin = submittedPIN {
+                submittedPIN = nil
+                (handshake, hello) = try Handshake.pairingReceiver(exporter: exporter, pin: pin)
+            } else if let key = self.pairingKey {
+                (handshake, hello) = Handshake.knownReceiver(exporter: exporter, key: key)
+            } else { throw BridgeError.authentication }
+            client.handshake = handshake
+            client.send(hello)
+        }, frame: { [weak self, weak client] frame in
+            guard let self, let client, self.conn === client, let handshake = client.handshake else { return }
+            let result = try handshake.receive(frame, save: { key in
+                try self.store.save(key)
+                self.pairingKey = key
+            })
+            switch result {
+            case .send(let reply): client.send(reply)
+            case .paired:
+                self.pairing = false
+                client.close()
+                self.resetRetry()
+                log("sender paired")
+            case .authenticated:
+                self.authenticated = true
+                self.resetRetry()
+                self.updateMenu()
+                log("connected to the paired sender")
+            case .application(let frame): try self.play(frame)
             }
+        }, closed: { [weak self, weak client] error in
+            guard let self, let client, self.conn === client else { return }
+            self.didClose(error)
+        })
+        queue.asyncAfter(deadline: .now() + handshakeTimeout) { [weak self, weak client] in
+            guard let self, let client, self.conn === client, !self.authenticated else { return }
+            client.close(BridgeError.authentication)
         }
-        c.start(queue: queue)
     }
 
-    private func disconnect() {
-        let wasReady = ready
-        conn?.cancel()
+    private func didClose(_ error: Error?) {
+        let wasPairing = pairing
+        let wasAuthenticated = authenticated
         conn = nil
-        ready = false
+        pairing = false
+        authenticated = false
         micRequested = false
+        hasHeader = false
         idleSince = nil
+        pauseSentAt = nil
+        requestedAt = nil
         output?.stop()
         output = nil
         outputRate = 0
         ring = nil
-        if wasReady { log("disconnected from sender") }
-    }
-
-    private func receive(_ c: NWConnection) {
-        c.receive(minimumIncompleteLength: 1, maximumLength: 16384) { [weak self] data, _, done, err in
-            guard let self, self.conn === c else { return }
-            if let data { self.handle(data) }
-            if done || err != nil { log("sender closed the connection"); self.disconnect(); return }
-            self.receive(c)
+        updateMenu()
+        if wasPairing {
+            let detail = (error as? BridgeError) == .storage
+                ? "无法保存配对记录。请检查文件权限，并在发送端取消配对后重试。"
+                : "请确认发送端仍显示有效配对码，再重新输入。若发送端已显示已配对，请先在发送端取消配对。"
+            showMessage("配对失败", detail)
+        } else if wasAuthenticated {
+            log("disconnected from the paired sender")
+        }
+        if pairingKey != nil, tried >= candidates.count {
+            tried = 0
+            let delay = min(30, 2 * pow(2, Double(min(failures, 4))))
+            nextAttempt = now + delay
+            failures += 1
+            if failures == 1 { log("cannot authenticate a sender — retrying in the background") }
         }
     }
 
-    private func handle(_ data: Data) {
-        pending.append(data)
-        var samples: [Float] = []
-        var consumed = 0
-        var newRate: Double?
-        pending.withUnsafeBytes { raw in
-            while raw.count - consumed >= 5 {
-                let type = raw[consumed]
-                let value = UInt32(littleEndian: raw.loadUnaligned(fromByteOffset: consumed + 1, as: UInt32.self))
-                if type == UInt8(ascii: "H") {
-                    newRate = Double(value)
-                    samples.removeAll()
-                    consumed += 5
-                } else if type == UInt8(ascii: "A") {
-                    let len = Int(value)
-                    guard raw.count - consumed >= 5 + len else { break }
-                    for i in 0..<len / 2 {
-                        let s = raw.loadUnaligned(fromByteOffset: consumed + 5 + i * 2, as: Int16.self)
-                        samples.append(Float(Int16(littleEndian: s)) / 32768)
-                    }
-                    consumed += 5 + len
-                } else {
-                    consumed = -1
-                    break
-                }
-            }
+    private func play(_ frame: BridgeFrame) throws {
+        guard authenticated else { throw BridgeError.authentication }
+        if frame.kind == .paused {
+            guard pauseSentAt != nil else { throw BridgeError.invalidFrame }
+            pauseSentAt = nil
+            return
         }
-        guard consumed >= 0 else { log("bad data from sender — is the Air running an older MicBridge?"); disconnect(); return }
-        pending.removeFirst(consumed)
-        if let newRate {
-            ensurePlayback(sampleRate: newRate)
+        // Frames already in flight when pause was sent must not refill the buffer.
+        guard micRequested else { return }
+        if frame.kind == .header {
+            let rate = Double(frame.payload.withUnsafeBytes { UInt32(littleEndian: $0.loadUnaligned(as: UInt32.self)) })
+            guard !hasHeader, (8_000...384_000).contains(rate) else { throw BridgeError.invalidFrame }
+            hasHeader = true
+            ensurePlayback(sampleRate: rate)
             ring?.reset()
             if let t = requestedAt {
-                log(String(format: "MacBook mic is on (%.2f s after the request)", Date().timeIntervalSince(t)))
+                log(String(format: "MacBook mic is on (%.2f s after the request)", now - t))
                 requestedAt = nil
             }
+        } else {
+            guard hasHeader else { throw BridgeError.invalidFrame }
+            let samples = frame.payload.withUnsafeBytes { raw in
+                (0..<(raw.count / 2)).map { i in
+                    Float(Int16(littleEndian: raw.loadUnaligned(fromByteOffset: i * 2, as: Int16.self))) / 32768
+                }
+            }
+            ring?.write(samples)
         }
-        if !samples.isEmpty { ring?.write(samples) }
     }
 
     private func ensurePlayback(sampleRate: Double) {
@@ -416,18 +504,3 @@ final class Receiver {
         }
     }
 }
-
-guard let device = findDevice(matching: deviceMatch) else {
-    log("no audio device matching \"\(deviceMatch)\" — install BlackHole first: brew install blackhole-2ch")
-    exit(1)
-}
-log("using virtual device: \(deviceName(device))")
-if setDefault {
-    setDefaultInput(device)
-    log("set \(deviceName(device)) as the default input device")
-}
-
-let receiver = Receiver(device: device)
-receiver.start()
-log(alwaysOn ? "always-on mode" : "the MacBook mic turns on when an app records from \(deviceName(device))")
-dispatchMain()

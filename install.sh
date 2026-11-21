@@ -22,7 +22,7 @@ case $role in
   *) echo "usage: $0 sender|receiver|uninstall [receiver options]"; exit 2 ;;
 esac
 
-[[ -d build/$app.app ]] || ./build.sh
+./build.sh
 remove
 mkdir -p ~/Applications ~/Library/LaunchAgents ~/Library/Logs
 cp -R build/$app.app ~/Applications/
