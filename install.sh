@@ -39,7 +39,7 @@ cat > $plist <<EOF
     <string>$HOME/Applications/$app.app/Contents/MacOS/$exe</string>
 $extra  </array>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ProcessType</key><string>Interactive</string>
   <key>StandardOutPath</key><string>$HOME/Library/Logs/micbridge-$role.log</string>
   <key>StandardErrorPath</key><string>$HOME/Library/Logs/micbridge-$role.log</string>

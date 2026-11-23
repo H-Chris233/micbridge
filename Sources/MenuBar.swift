@@ -25,6 +25,10 @@ final class MenuBar: NSObject {
         menu.addItem(status)
         menu.addItem(.separator())
         for entry in [self.begin, self.forget] { entry.target = self; menu.addItem(entry) }
+        menu.addItem(.separator())
+        let quit = NSMenuItem(title: "退出 MicBridge", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        quit.target = NSApp
+        menu.addItem(quit)
         item.menu = menu
         update(paired: false)
     }
